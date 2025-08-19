@@ -2582,10 +2582,18 @@
                         descricao: item.descricao,
                         preco: item.preco, // Manter como string para suportar preços múltiplos
                         imagem: processImageUrl(item.foto_url),
+                        // Estoque e disponibilidade
+                        controleEstoque: (String(item.controle_estoque || '').trim().toLowerCase() === 'sim'),
+                        estoqueAtual: (() => { const v = parseFloat(String(item.estoque_atual || '0').replace(',', '.')); return isNaN(v) ? 0 : v; })(),
                         disponivel: true,
                         classificacaoAdicional: item.classificacao_adicional,
                         observacoes: item.observacoes
                     };
+
+                    // Se controle de estoque ativo e estoque <= 0, marcar indisponível
+                    if (processedItem.controleEstoque && (!processedItem.estoqueAtual || processedItem.estoqueAtual <= 0)) {
+                        processedItem.disponivel = false;
+                    }
                     
                     // Add the item to each valid category
                     itemCategories.forEach(categoryName => {
@@ -4528,6 +4536,23 @@
             
             if (typeof debugLog === 'function') {
                 debugLog('✅ Prosseguindo para adicionar ao carrinho...');
+            }
+
+            // Regra de estoque: se controle_estoque=Sim, impedir exceder estoque_atual
+            try {
+                const pedidoMinimoRaw = getConfig('checkout', 'pedido_minimo', '');
+                const pedidoMinimoValor = parseFloat(String(pedidoMinimoRaw).replace(',', '.'));
+                window.__pedidoMinimoValor = isNaN(pedidoMinimoValor) ? null : pedidoMinimoValor;
+            } catch (_) { window.__pedidoMinimoValor = null; }
+
+            if (product.controleEstoque) {
+                // Quantidade atual desse mesmo item (mesma chave) no carrinho
+                const currentQtySameKey = (cart.find(i => i.itemKey === `${productId}-${Object.keys(variations).sort().join('-')}${(getPriceType(product.preco) === 'multiple' && product.selectedBaseName) ? `-base-${product.selectedBaseName.replace(/[^a-zA-Z0-9]/g, '')}` : ''}${notes ? `-notes-${btoa(notes).replace(/[^a-zA-Z0-9]/g, '')}` : ''}`)?.quantity) || 0;
+                const totalRequested = currentQtySameKey + quantity;
+                if (product.estoqueAtual <= 0 || totalRequested > product.estoqueAtual) {
+                    showToast(`Estoque insuficiente para "${product.nome}". Disponível: ${product.estoqueAtual}`, 'warning');
+                    return;
+                }
             }
 
             // Calculate variation price
@@ -6605,6 +6630,14 @@
                 if (appliedCoupon && couponDiscount > 0) {
                     finalTotal = Math.max(0, finalTotal - couponDiscount);
                 }
+
+                // Pedido mínimo (Config: section=checkout, key=pedido_minimo)
+                let pedidoMinimoVal = null;
+                try {
+                    const pedidoMinimoRaw = getConfig('checkout', 'pedido_minimo', '');
+                    const parsed = parseFloat(String(pedidoMinimoRaw).replace(',', '.'));
+                    if (!isNaN(parsed) && parsed > 0) pedidoMinimoVal = parsed;
+                } catch (_) {}
                 
                 debugLog('=== ATUALIZANDO TOTAL DO CHECKOUT ===');
                 debugLog('Subtotal carrinho:', formatCurrency(cartTotal));
@@ -6617,6 +6650,24 @@
                 
                 // Atualizar novo resumo limpo
                 updateOrderSummary(cartTotal, deliveryFee);
+
+                // UI de pedido mínimo
+                const minAlertId = 'min-order-alert';
+                const existing = document.getElementById(minAlertId);
+                if (pedidoMinimoVal && finalTotal < pedidoMinimoVal) {
+                    if (!existing) {
+                        const block = document.createElement('div');
+                        block.id = minAlertId;
+                        block.className = 'text-xs mt-2';
+                        block.style.color = 'var(--cor-erro)';
+                        block.textContent = `Pedido mínimo: ${formatCurrency(pedidoMinimoVal)}. Faltam ${formatCurrency(pedidoMinimoVal - finalTotal)}.`;
+                        totalElement.parentNode.appendChild(block);
+                    } else {
+                        existing.textContent = `Pedido mínimo: ${formatCurrency(pedidoMinimoVal)}. Faltam ${formatCurrency(pedidoMinimoVal - finalTotal)}.`;
+                    }
+                } else if (existing) {
+                    existing.remove();
+                }
             }
         }
         
@@ -9707,6 +9758,23 @@
                 showToast('Por favor, preencha todos os campos obrigatórios', 'error');
                 return;
             }
+
+            // Checagem de pedido mínimo antes de finalizar
+            try {
+                let pedidoMinimoVal = null;
+                const pedidoMinimoRaw = getConfig('checkout', 'pedido_minimo', '');
+                const parsed = parseFloat(String(pedidoMinimoRaw).replace(',', '.'));
+                if (!isNaN(parsed) && parsed > 0) pedidoMinimoVal = parsed;
+                if (pedidoMinimoVal) {
+                    const cartTotal = calculateCartTotal();
+                    const fee = (orderData && orderData.deliveryType === 'delivery') ? ((orderData.address && typeof orderData.address.deliveryFee !== 'undefined') ? orderData.address.deliveryFee : (typeof currentDeliveryFee !== 'undefined' && currentDeliveryFee !== null ? currentDeliveryFee : 0)) : 0;
+                    let finalTotal = cartTotal + fee - (appliedCoupon && couponDiscount > 0 ? couponDiscount : 0);
+                    if (finalTotal < pedidoMinimoVal) {
+                        showToast(`Pedido mínimo: ${formatCurrency(pedidoMinimoVal)}. Adicione mais itens.`, 'warning');
+                        return;
+                    }
+                }
+            } catch (_) {}
             
             // Verificar se cupom ainda é válido antes de finalizar
             if (appliedCoupon) {
