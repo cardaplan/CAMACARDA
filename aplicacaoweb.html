@@ -58,6 +58,19 @@
   </div>
 
   <div class="container" id="screen-pedidos">
+    <div class="card" style="margin-bottom:12px">
+      <div class="h2">Ações Rápidas</div>
+      <div class="row wrap" style="gap:8px">
+        <button class="btn secondary" onclick="showTab('pedidos')">📦 Pedidos</button>
+        <button class="btn secondary" onclick="showTab('relatorios')">📊 Relatórios</button>
+        <button class="btn secondary" onclick="toast('Itens: gerenciamento disponível na versão completa desta UI')">📦 Itens</button>
+        <button class="btn secondary" onclick="toast('Categorias: gerenciamento disponível na versão completa desta UI')">🏷️ Categorias</button>
+        <button class="btn secondary" onclick="toast('Cupons: gerenciamento disponível na versão completa desta UI')">🎟️ Cupons</button>
+        <button class="btn secondary" onclick="toast('Config: gerenciamento disponível na versão completa desta UI')">⚙️ Config</button>
+        <button class="btn secondary" onclick="toast('Bairros: gerenciamento disponível na versão completa desta UI')">🏘️ Bairros</button>
+        <button class="btn secondary" onclick="toast('Horários: gerenciamento disponível na versão completa desta UI')">🕐 Horários</button>
+      </div>
+    </div>
     <div class="card">
       <div class="row wrap" style="gap:8px">
         <div class="col"><input id="pedidosFilter" type="text" placeholder="Filtrar por cliente, status, total..." oninput="filterPedidos()" /></div>
