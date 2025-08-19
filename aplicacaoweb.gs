@@ -29,7 +29,12 @@ const SHEET_CONFIG = {
       { name: 'status', type: 'select', required: true, options: ['Ativo', 'Inativo', 'Esgotado'] },
       { name: 'classificacao_adicional', type: 'text', required: false },
       { name: 'observacoes', type: 'textarea', required: false },
-      { name: 'foto_url', type: 'url', required: false }
+      { name: 'foto_url', type: 'url', required: false },
+      // ===== Novos campos (Controle de Estoque e ID alternado) =====
+      { name: 'estoque_inicial', type: 'number', required: false },
+      { name: 'estoque_atual', type: 'number', required: false },
+      { name: 'controle_estoque', type: 'select', required: false, options: ['Sim', 'Não'] },
+      { name: 'usar_id_alternado', type: 'select', required: false, options: ['Sim', 'Não'] }
     ]
   },
   'Categorias': {
@@ -102,12 +107,381 @@ const cache = {
   TTL: 5 * 60 * 1000 // 5 minutos
 };
 
+// Nomes de abas auxiliares
+const SHEET_PEDIDOS = 'Pedidos';
+const SHEET_RELATORIOS = 'Relatórios';
+const SHEET_ESTOQUE_HIST = 'Estoque_Historico';
+
+// Status padrão de pedidos
+const PEDIDO_STATUS = {
+  PENDENTE: 'Pendente',
+  PAGO: 'Pedido pago ✅',
+  CANCELADO: 'Pedido cancelado ❌'
+};
+
+/**
+ * Obter referência de planilha por nome (cria se não existir)
+ */
+function getOrCreateSheet(sheetName) {
+  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  let sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(sheetName);
+  }
+  return sheet;
+}
+
+/**
+ * Garantir cabeçalho das abas criadas dinamicamente
+ */
+function ensureSheetHeaders() {
+  // Pedidos
+  const pedidos = getOrCreateSheet(SHEET_PEDIDOS);
+  if (pedidos.getLastRow() === 0) {
+    pedidos.appendRow([
+      'order_id', 'timestamp', 'status_pedido', 'cliente_nome', 'whatsapp_cliente', 'delivery_tipo',
+      'endereco_rua', 'endereco_numero', 'endereco_bairro', 'endereco_cidade', 'endereco_estado', 'endereco_cep', 'endereco_complemento',
+      'pagamento_metodo', 'troco_para', 'observacoes',
+      'subtotal_produtos', 'taxa_entrega', 'desconto', 'total_final',
+      'itens_json', 'cupom_codigo', 'cupom_tipo'
+    ]);
+  }
+  // Relatórios
+  const rel = getOrCreateSheet(SHEET_RELATORIOS);
+  if (rel.getLastRow() === 0) {
+    rel.appendRow(['mes', 'produto_sku', 'produto_nome', 'quantidade', 'valor_total']);
+  }
+  // Histórico de Estoque
+  const hist = getOrCreateSheet(SHEET_ESTOQUE_HIST);
+  if (hist.getLastRow() === 0) {
+    hist.appendRow(['timestamp', 'sku', 'item', 'movimento', 'quantidade', 'saldo', 'motivo', 'order_id']);
+  }
+}
+
+/**
+ * Gera um ID de pedido único
+ */
+function generateOrderId() {
+  const ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss');
+  const rand = Utilities.getUuid().split('-')[0].toUpperCase();
+  return `ORD-${ts}-${rand}`;
+}
+
+/**
+ * Gera ID alternado rotativo por SKU (ex.: M05, A56)
+ * Usa PropertiesService para manter o contador por SKU.
+ */
+function generateAlternateIdForSku(sku) {
+  const props = PropertiesService.getScriptProperties();
+  const key = `alt_id_counter::${sku}`;
+  let counter = parseInt(props.getProperty(key) || '0', 10);
+  counter = (counter + 1) % 100; // 00..99
+  props.setProperty(key, String(counter));
+  const letters = ['M', 'A', 'U', 'B', 'K', 'Z', 'R', 'T'];
+  const letter = letters[counter % letters.length];
+  const num = (counter < 10 ? '0' : '') + counter;
+  return `${letter}${num}`;
+}
+
+/**
+ * Atualiza estoque de acordo com itens do pedido e registra histórico
+ */
+function updateStockForOrder(orderId, items) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const itensSheet = ss.getSheetByName('Itens');
+  if (!itensSheet) return;
+  const lastRow = itensSheet.getLastRow();
+  const lastCol = itensSheet.getLastColumn();
+  if (lastRow < 2) return;
+  const values = itensSheet.getRange(1, 1, lastRow, lastCol).getValues();
+  const headers = values[0];
+  const idx = {
+    sku: headers.indexOf('SKU'),
+    item: headers.indexOf('item'),
+    status: headers.indexOf('status'),
+    estoqueInicial: headers.indexOf('estoque_inicial'),
+    estoqueAtual: headers.indexOf('estoque_atual'),
+    controleEstoque: headers.indexOf('controle_estoque')
+  };
+  const hist = getOrCreateSheet(SHEET_ESTOQUE_HIST);
+
+  // Mapa SKU -> {qty}
+  const skuToQty = {};
+  (items || []).forEach(it => {
+    const sku = it.sku || it.SKU;
+    const q = parseFloat(it.quantity || it.qtd || 0) || 0;
+    if (!sku) return;
+    skuToQty[sku] = (skuToQty[sku] || 0) + q;
+  });
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const sku = idx.sku >= 0 ? row[idx.sku] : '';
+    if (!sku || !(sku in skuToQty)) continue;
+    const wantsControl = idx.controleEstoque >= 0 ? String(row[idx.controleEstoque] || '').toLowerCase() === 'sim' : false;
+    if (!wantsControl) continue;
+    const qty = skuToQty[sku];
+    const atual = idx.estoqueAtual >= 0 ? (parseFloat(row[idx.estoqueAtual]) || 0) : 0;
+    let novo = Math.max(0, atual - qty);
+    if (idx.estoqueAtual >= 0) {
+      itensSheet.getRange(r + 1, idx.estoqueAtual + 1).setValue(novo);
+    }
+    // Se zerou, marcar como Esgotado
+    if (novo === 0 && idx.status >= 0) {
+      itensSheet.getRange(r + 1, idx.status + 1).setValue('Esgotado');
+    }
+    // Registrar histórico
+    const nome = idx.item >= 0 ? row[idx.item] : '';
+    hist.appendRow([new Date(), sku, nome, 'Saída', -qty, novo, 'Pedido', orderId]);
+  }
+  // invalidar cache da aba Itens
+  delete cache.data['Itens'];
+  delete cache.timestamp['Itens'];
+}
+
+/**
+ * Registra pedido recebido (via webhook/front-end) na aba Pedidos e aplica regras
+ * @param {Object} payload JSON com dados do pedido
+ */
+function registerOrderFromWebhook(payload) {
+  ensureSheetHeaders();
+  try {
+    if (!payload || typeof payload !== 'object') {
+      throw new Error('Payload inválido');
+    }
+    const pedidos = getOrCreateSheet(SHEET_PEDIDOS);
+    const orderId = generateOrderId();
+
+    // Extrações seguras
+    const customer = payload.customer || {};
+    const items = payload.items || [];
+    const totals = payload.totals || {};
+    const coupon = payload.coupon || null;
+
+    // Gerar IDs alternados por item (se habilitado no cadastro do item)
+    const itensData = getSheetData('Itens');
+    const headers = itensData[0] || [];
+    const idxMap = {
+      sku: headers.indexOf('SKU'),
+      usarAlt: headers.indexOf('usar_id_alternado')
+    };
+    const altIdBySku = {};
+    if (itensData.length > 1 && idxMap.sku >= 0) {
+      const map = new Map();
+      itensData.slice(1).forEach(row => {
+        const sku = row[idxMap.sku];
+        const usarAlt = idxMap.usarAlt >= 0 ? String(row[idxMap.usarAlt] || '').toLowerCase() === 'sim' : false;
+        map.set(sku, usarAlt);
+      });
+      (items || []).forEach(it => {
+        const sku = it.sku || it.SKU;
+        if (sku && map.get(sku)) {
+          altIdBySku[sku] = generateAlternateIdForSku(sku);
+        }
+      });
+    }
+
+    // Calcular totais defensivamente
+    const subtotal = Number(totals.subtotal_products_numeric || payload.subtotal || 0) || 0;
+    const delivery = Number(totals.delivery_fee_numeric || payload.delivery_fee || 0) || 0;
+    const discount = Number((payload.coupon_applied ? (payload.coupon?.discount_numeric || 0) : 0)) || 0;
+    const total = Number(totals.total_final_numeric || payload.total || subtotal + delivery - discount) || 0;
+
+    // Linhas para planilha Pedidos
+    const row = [
+      orderId,
+      new Date(),
+      PEDIDO_STATUS.PENDENTE,
+      payload.customer_name || customer.name || '',
+      payload.whatsapp_customer || '',
+      customer.delivery_type || payload.delivery_type || '',
+      (customer.address && customer.address.street) || '',
+      (customer.address && customer.address.number) || '',
+      (customer.address && customer.address.neighborhood) || '',
+      (customer.address && customer.address.city) || '',
+      (customer.address && customer.address.state) || '',
+      (customer.address && customer.address.cep) || '',
+      (customer.address && customer.address.complement) || '',
+      customer.payment_method || payload.payment_method || '',
+      customer.change_amount || payload.change_amount || '',
+      customer.notes || payload.notes || '',
+      subtotal,
+      delivery,
+      discount,
+      total,
+      JSON.stringify(items.map(it => ({
+        id: it.id,
+        nome: it.name || it.nome,
+        sku: it.sku,
+        quantity: it.quantity,
+        price: it.price_numeric || it.price || 0,
+        alt_id: altIdBySku[it.sku] || null
+      }))),
+      coupon ? (coupon.code || '') : '',
+      coupon ? (coupon.type || '') : ''
+    ];
+    pedidos.appendRow(row);
+
+    // Atualizar estoque e histórico
+    updateStockForOrder(orderId, items);
+
+    // Resposta
+    return { success: true, orderId, altIds: altIdBySku };
+  } catch (error) {
+    Logger.log('[registerOrderFromWebhook] ERRO: ' + error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Lista pedidos (mais recentes primeiro)
+ */
+function getOrders() {
+  ensureSheetHeaders();
+  const sheet = getOrCreateSheet(SHEET_PEDIDOS);
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2) return [];
+  const values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  const headers = values[0];
+  const rows = values.slice(1).reverse();
+  return rows.map(r => {
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = r[i]);
+    return obj;
+  });
+}
+
+/**
+ * Atualiza status do pedido por order_id
+ */
+function updateOrderStatus(orderId, newStatus) {
+  ensureSheetHeaders();
+  const allowed = [PEDIDO_STATUS.PENDENTE, PEDIDO_STATUS.PAGO, PEDIDO_STATUS.CANCELADO];
+  if (!allowed.includes(newStatus)) throw new Error('Status inválido');
+  const sheet = getOrCreateSheet(SHEET_PEDIDOS);
+  const values = sheet.getDataRange().getValues();
+  const headers = values[0];
+  const idxOrderId = headers.indexOf('order_id');
+  const idxStatus = headers.indexOf('status_pedido');
+  for (let r = 1; r < values.length; r++) {
+    if (values[r][idxOrderId] === orderId) {
+      sheet.getRange(r + 1, idxStatus + 1).setValue(newStatus);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Agrega vendas apenas de pedidos pagos
+ */
+function getSalesReports() {
+  ensureSheetHeaders();
+  const pedidos = getOrCreateSheet(SHEET_PEDIDOS);
+  const values = pedidos.getDataRange().getValues();
+  if (values.length < 2) {
+    return {
+      produtosMaisPedidos: [],
+      valorTotalVendidoMes: 0,
+      pedidosDia: [], pedidosSemana: [], pedidosMes: []
+    };
+  }
+  const headers = values[0];
+  const idx = {
+    status: headers.indexOf('status_pedido'),
+    total: headers.indexOf('total_final'),
+    timestamp: headers.indexOf('timestamp'),
+    itensJson: headers.indexOf('itens_json')
+  };
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfWeek = new Date(startOfDay); startOfWeek.setDate(startOfDay.getDate() - startOfDay.getDay());
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  let totalMonth = 0;
+  const itemsCount = new Map(); // sku -> {nome, quantidade}
+  const pedidosDia = [];
+  const pedidosSemana = [];
+  const pedidosMes = [];
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    if (row[idx.status] !== PEDIDO_STATUS.PAGO) continue;
+    const ts = new Date(row[idx.timestamp]);
+    const total = Number(row[idx.total] || 0) || 0;
+    if (ts >= startOfMonth) totalMonth += total;
+    if (ts >= startOfDay) pedidosDia.push({ data: ts, total });
+    if (ts >= startOfWeek) pedidosSemana.push({ data: ts, total });
+    if (ts >= startOfMonth) pedidosMes.push({ data: ts, total });
+    try {
+      const itens = JSON.parse(row[idx.itensJson] || '[]');
+      itens.forEach(it => {
+        const key = it.sku || it.SKU || it.id || it.nome;
+        const curr = itemsCount.get(key) || { nome: it.nome || it.name || key, quantidade: 0 };
+        curr.quantidade += Number(it.quantity || 0) || 0;
+        itemsCount.set(key, curr);
+      });
+    } catch (_) {}
+  }
+  const produtosMaisPedidos = Array.from(itemsCount.entries())
+    .map(([sku, data]) => ({ sku, nome: data.nome, quantidade: data.quantidade }))
+    .sort((a, b) => b.quantidade - a.quantidade)
+    .slice(10);
+
+  return {
+    produtosMaisPedidos,
+    valorTotalVendidoMes: totalMonth,
+    pedidosDia,
+    pedidosSemana,
+    pedidosMes
+  };
+}
+
+/**
+ * Gera PDF simples de vendas a partir de getSalesReports
+ */
+function gerarRelatorioVendasPDF() {
+  const dados = getSalesReports();
+  const doc = DocumentApp.create('Relatório de Vendas - ' + new Date().toLocaleDateString('pt-BR'));
+  const body = doc.getBody();
+  body.appendParagraph('RELATÓRIO DE VENDAS').setHeading(DocumentApp.ParagraphHeading.TITLE);
+  body.appendParagraph('Gerado em: ' + new Date().toLocaleString('pt-BR'));
+  body.appendParagraph('');
+  body.appendParagraph('Total vendido no mês: ' + dados.valorTotalVendidoMes.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }));
+  body.appendParagraph('');
+  body.appendParagraph('Produtos mais pedidos').setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  dados.produtosMaisPedidos.forEach((p, idx) => body.appendParagraph(`${idx + 1}. ${p.nome} (${p.sku}) - ${p.quantidade} un`));
+  doc.saveAndClose();
+  const file = DriveApp.getFileById(doc.getId());
+  const pdf = file.getBlob().getAs('application/pdf');
+  const pdfFile = DriveApp.createFile(pdf).setName('Relatorio_Vendas_' + new Date().toISOString().slice(0, 10) + '.pdf');
+  DriveApp.getFileById(doc.getId()).setTrashed(true);
+  return { success: true, fileId: pdfFile.getId(), downloadUrl: `https://drive.google.com/file/d/${pdfFile.getId()}/view` };
+}
+
 /**
  * Função principal para servir a aplicação web
  */
-function doGet() {
+function doGet(e) {
   try {
     Logger.log('[doGet] Iniciando aplicação web');
+    // Suporte a endpoint de registro de pedidos via querystring (sem quebrar UI)
+    const request = e || null;
+    // Nota: em Apps Script, doGet(e) recebe parâmetros; aqui mantemos compatibilidade com doGet() antigo
+    // Para ativar este modo, altere a assinatura para function doGet(e) se necessário no deploy.
+    // Abaixo, fallback: tenta acessar parâmetros globais do serviço se e não estiver disponível.
+    try {
+      // @ts-ignore
+      if (request && request.parameter) {
+        const params = request.parameter || {};
+        if (params.action === 'register_order') {
+          const data = params.data ? JSON.parse(params.data) : null;
+          const result = registerOrderFromWebhook(data);
+          return ContentService.createTextOutput(JSON.stringify(result)).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+    } catch (_ignore) {}
     
     const htmlOutput = HtmlService.createHtmlOutputFromFile("Index")
       .setTitle("Cardaplan - Gestão Inteligente")
@@ -607,7 +981,12 @@ function getDashboardStats() {
       totalHorarios: 0,
       totalVisualizacoes: 0,
       sessesUnicas: 0,
-      visualizacoesHoje: 0
+      visualizacoesHoje: 0,
+      // ===== KPIs adicionais
+      totalPedidosHoje: 0,
+      ticketMedio: 0,
+      produtoMaisVendido: '',
+      totalClientesUnicos: 0
     };
 
     // Itens
@@ -686,6 +1065,50 @@ function getDashboardStats() {
       Logger.log(`[getDashboardStats] Erro ao obter analytics: ${error.message}`);
     }
     
+    // KPIs de Pedidos (apenas pagos)
+    try {
+      ensureSheetHeaders();
+      const pedidos = getOrCreateSheet(SHEET_PEDIDOS);
+      const values = pedidos.getDataRange().getValues();
+      if (values.length > 1) {
+        const headers = values[0];
+        const idx = {
+          status: headers.indexOf('status_pedido'),
+          total: headers.indexOf('total_final'),
+          ts: headers.indexOf('timestamp'),
+          itens: headers.indexOf('itens_json'),
+          cliente: headers.indexOf('whatsapp_cliente')
+        };
+        const hojeStr = new Date().toDateString();
+        let somaMes = 0, qtdMes = 0;
+        const inicioMes = new Date(); inicioMes.setDate(1); inicioMes.setHours(0,0,0,0);
+        const mapVendas = new Map();
+        const clientes = new Set();
+        for (let r = 1; r < values.length; r++) {
+          const row = values[r];
+          if (row[idx.status] !== PEDIDO_STATUS.PAGO) continue;
+          const ts = new Date(row[idx.ts]);
+          const total = Number(row[idx.total] || 0) || 0;
+          if (ts.toDateString() === hojeStr) stats.totalPedidosHoje++;
+          if (ts >= inicioMes) { somaMes += total; qtdMes++; }
+          try {
+            const itens = JSON.parse(row[idx.itens] || '[]');
+            itens.forEach(it => {
+              const key = it.sku || it.id || it.nome;
+              const prev = mapVendas.get(key) || { nome: it.nome || key, qtd: 0 };
+              prev.qtd += Number(it.quantity || 0) || 0;
+              mapVendas.set(key, prev);
+            });
+          } catch (_) {}
+          const cli = row[idx.cliente]; if (cli) clientes.add(cli);
+        }
+        stats.ticketMedio = qtdMes > 0 ? (somaMes / qtdMes) : 0;
+        const top = Array.from(mapVendas.values()).sort((a,b)=>b.qtd-a.qtd)[0];
+        stats.produtoMaisVendido = top ? top.nome : '';
+        stats.totalClientesUnicos = clientes.size;
+      }
+    } catch (e) { Logger.log('[getDashboardStats] Erro KPIs pedidos: ' + e.message); }
+    
     Logger.log('[getDashboardStats] Estatísticas obtidas:', stats);
     return stats;
     
@@ -734,6 +1157,27 @@ function getTaxaEntregaBairro(nomeBairro) {
   try {
     Logger.log(`[getTaxaEntregaBairro] Buscando taxa para: ${nomeBairro}`);
     
+    // Verificar se há taxa única definida na Config
+    try {
+      const configData = getSheetData('Config');
+      const headers = (configData && configData[0]) || [];
+      const idxSection = headers.indexOf('section');
+      const idxKey = headers.indexOf('key');
+      const idxValue = headers.indexOf('value');
+      if (idxSection >= 0 && idxKey >= 0 && idxValue >= 0) {
+        const valorTaxaUnicaRow = configData.slice(1).find(r => String(r[idxSection]).toLowerCase() === 'checkout' && String(r[idxKey]).toLowerCase() === 'valor_taxa_unica' && String(r[idxValue]).trim() !== '');
+        if (valorTaxaUnicaRow) {
+          const taxaUnica = parseFloat(String(valorTaxaUnicaRow[idxValue]).replace(/[^0-9.,]/g, '').replace(',', '.'));
+          if (!isNaN(taxaUnica) && taxaUnica >= 0) {
+            Logger.log(`[getTaxaEntregaBairro] Aplicando taxa única: ${taxaUnica}`);
+            return taxaUnica;
+          }
+        }
+      }
+    } catch (e) {
+      Logger.log(`[getTaxaEntregaBairro] Aviso ao ler taxa única: ${e.message}`);
+    }
+
     const data = getSheetData('Bairros');
     if (data.length <= 1) {
       return null;
@@ -1224,8 +1668,16 @@ function doPost(e) {
       ]);
     }
 
-    return ContentService.createTextOutput("OK")
-      .setMimeType(ContentService.MimeType.TEXT);
+    // Suporte a registro de pedido via webhook (conteúdo em JSON com campo kind='order')
+    try {
+      const tryJson = JSON.parse(e.postData.contents || '{}');
+      if (tryJson && tryJson.kind === 'order') {
+        const result = registerOrderFromWebhook(tryJson.data || tryJson);
+        return ContentService.createTextOutput(JSON.stringify(result)).setMimeType(ContentService.MimeType.JSON);
+      }
+    } catch (_ignore) {}
+
+    return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
 
   } catch (err) {
     return ContentService.createTextOutput("Erro: " + err)
