@@ -361,11 +361,63 @@ function generateAlternateId() { const props = PropertiesService.getScriptProper
 function getOrders() { const data = getSheetData('Pedidos'); if (data.length<=1) return []; const headers = data[0]; return data.slice(1).map((row, idx)=>({ rowIndex: idx+2, data: headers.reduce((acc,h,i)=>{acc[h]=row[i]; return acc;}, {}) })); }
 function updateOrderStatus(rowIndex, novoStatus) { const ss = SpreadsheetApp.openById(SPREADSHEET_ID); const sheet = ss.getSheetByName('Pedidos'); if (!sheet) throw new Error('Aba Pedidos não encontrada'); const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0]; const idxStatus = headers.indexOf('status_pedido'); if (idxStatus<0) throw new Error('Coluna status_pedido não encontrada'); sheet.getRange(rowIndex, idxStatus+1).setValue(novoStatus); return true; }
 
-function getSalesReports() {
-  const pedidos = getOrders().filter(p => (p.data.status_pedido || '').toString().toLowerCase().indexOf('pago')>=0);
+function getSalesReports(dataInicio, dataFim) {
+  let pedidos = getOrders().filter(p => (p.data.status_pedido || '').toString().toLowerCase().indexOf('pago')>=0);
+  // Filtro por período (datas no timezone local do Apps Script)
+  if (dataInicio || dataFim) {
+    const inicio = dataInicio ? new Date(dataInicio) : new Date('2000-01-01');
+    const fim = dataFim ? new Date(dataFim) : new Date('2999-12-31T23:59:59');
+    pedidos = pedidos.filter(p => {
+      const dh = new Date(p.data.data_hora);
+      return dh >= inicio && dh <= fim;
+    });
+  }
   const produtoCount = {}; const produtoNome = {}; let totalMesAtual = 0; const now = new Date(); const ymAtual = now.toISOString().slice(0,7); const pedidosDia=[]; const pedidosSemana=[]; const pedidosMes=[]; const uniqueCustomers=new Set();
   pedidos.forEach(p=>{ const dh=new Date(p.data.data_hora); const items = JSON.parse(p.data.itens_json||'[]'); const total=Number(p.data.total||0); const ym = dh.toISOString().slice(0,7); if (ym===ymAtual) totalMesAtual+=total; uniqueCustomers.add((p.data.cliente_whatsapp||'').toString().trim()); items.forEach(it=>{ const sku=it.sku||''; const nome=it.name||it.nome||sku; const qtd=Number(it.quantity||0); produtoCount[sku]=(produtoCount[sku]||0)+qtd; if(!produtoNome[sku]) produtoNome[sku]=nome; }); const reg={data:dh,pedido:p}; const hojeStr=now.toDateString(); if (dh.toDateString()===hojeStr) pedidosDia.push(reg); const diff=(now-dh)/(1000*60*60*24); if (diff<=7) pedidosSemana.push(reg); if (ym===ymAtual) pedidosMes.push(reg); });
   const produtosMaisPedidos = Object.entries(produtoCount).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([sku,qtd])=>({ sku, produto: produtoNome[sku]||sku, quantidade:qtd }));
-  let produtosMaisVisualizados=[]; try { const analytics=getAnalyticsReports(); produtosMaisVisualizados=analytics.produtosMaisVisualizados||[]; } catch(_) {}
+  let produtosMaisVisualizados=[]; try { const analytics=getAnalyticsReports(dataInicio||null, dataFim||null); produtosMaisVisualizados=analytics.produtosMaisVisualizados||[]; } catch(_) {}
   return { produtosMaisVisualizados, produtosMaisPedidos, valorTotalVendidoNoMes: totalMesAtual, pedidos: { dia: pedidosDia.map(x=>x.pedido), semana: pedidosSemana.map(x=>x.pedido), mes: pedidosMes.map(x=>x.pedido) }, kpis: { totalPedidosHoje: pedidosDia.length, ticketMedio: pedidosMes.length ? (totalMesAtual / pedidosMes.length) : 0, produtoMaisVendido: produtosMaisPedidos[0] || null, totalClientesUnicos: Array.from(uniqueCustomers).filter(Boolean).length } };
+}
+
+// Gera XLSX com resumo dos relatórios
+function gerarRelatorioXLSX(dadosRelatorio) {
+  try {
+    const ss = SpreadsheetApp.create('Relatório Cardaplan XLSX - ' + new Date().toLocaleDateString('pt-BR'));
+    const sheet = ss.getActiveSheet();
+    sheet.setName('Resumo');
+    let row = 1;
+    sheet.getRange(row++,1).setValue('RESUMO GERAL');
+    sheet.getRange(row++,1,1,2).setValues([[ 'Pedidos Hoje', (dadosRelatorio.kpis && dadosRelatorio.kpis.totalPedidosHoje) || 0 ]]);
+    sheet.getRange(row++,1,1,2).setValues([[ 'Ticket Médio', (dadosRelatorio.kpis && dadosRelatorio.kpis.ticketMedio) || 0 ]]);
+    sheet.getRange(row++,1,1,2).setValues([[ 'Clientes Únicos', (dadosRelatorio.kpis && dadosRelatorio.kpis.totalClientesUnicos) || 0 ]]);
+    row++;
+    sheet.getRange(row++,1).setValue('Produtos mais visualizados');
+    sheet.getRange(row++,1,1,2).setValues([[ 'Produto', 'Visualizações' ]]);
+    (dadosRelatorio.produtosMaisVisualizados||[]).forEach(item => {
+      sheet.getRange(row++,1,1,2).setValues([[ item.nomeItem, item.visualizacoes ]]);
+    });
+    row++;
+    sheet.getRange(row++,1).setValue('Produtos mais pedidos');
+    sheet.getRange(row++,1,1,2).setValues([[ 'Produto', 'Quantidade' ]]);
+    (dadosRelatorio.produtosMaisPedidos||[]).forEach(item => {
+      sheet.getRange(row++,1,1,2).setValues([[ item.produto, item.quantidade ]]);
+    });
+    row++;
+    sheet.getRange(row++,1).setValue('Pedidos do mês');
+    sheet.getRange(row++,1,1,3).setValues([[ 'Data', 'Cliente', 'Total' ]]);
+    (dadosRelatorio.pedidos && dadosRelatorio.pedidos.mes || []).forEach(p => {
+      const d = p.data;
+      sheet.getRange(row++,1,1,3).setValues([[ new Date(d.data_hora), d.cliente_nome, Number(d.total||0) ]]);
+    });
+    // Converter para XLSX
+    const file = DriveApp.getFileById(ss.getId());
+    const xlsxBlob = file.getBlob().getAs('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    const xlsxFile = DriveApp.createFile(xlsxBlob);
+    xlsxFile.setName('Relatorio_Cardaplan_'+new Date().toISOString().split('T')[0]+'.xlsx');
+    // Remover planilha temporária
+    file.setTrashed(true);
+    return { success:true, fileId:xlsxFile.getId(), downloadUrl: `https://drive.google.com/file/d/${xlsxFile.getId()}/view` };
+  } catch (error) {
+    throw new Error('Erro ao gerar XLSX: '+error.message);
+  }
 }

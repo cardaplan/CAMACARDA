@@ -72,6 +72,21 @@
   </div>
 
   <div class="container" id="screen-relatorios" style="display:none">
+    <div class="card" style="margin-bottom:12px">
+      <div class="row wrap">
+        <div>
+          <div class="muted" style="font-size:12px">Período</div>
+          <div class="row wrap">
+            <input type="date" id="filtroDataInicio" />
+            <input type="date" id="filtroDataFim" />
+          </div>
+        </div>
+        <div class="actions" style="margin-left:auto">
+          <button class="btn secondary" onclick="aplicarFiltroPeriodo()">Aplicar</button>
+          <button class="btn secondary" onclick="limparFiltroPeriodo()">Limpar</button>
+        </div>
+      </div>
+    </div>
     <div class="grid" style="margin-bottom:12px">
       <div class="metric"><div class="label">Pedidos Hoje</div><div class="value" id="kpiPedidosHoje">0</div></div>
       <div class="metric"><div class="label">Ticket Médio</div><div class="value" id="kpiTicketMedio">R$ 0,00</div></div>
@@ -85,6 +100,7 @@
         <button class="btn secondary" onclick="loadRelatoriosScreen()">Atualizar</button>
         <button class="btn primary" onclick="exportRelatorioPDF()">Exportar PDF</button>
         <button class="btn secondary" onclick="exportRelatorioCSV()">Exportar CSV</button>
+        <button class="btn secondary" onclick="exportRelatorioXLSX()">Exportar XLSX</button>
       </div>
     </div>
     <div class="card" style="margin-bottom:12px"><canvas id="chartVisualizados" height="140"></canvas></div>
@@ -168,6 +184,8 @@
     let __reports = null; let chartV=null; let chartP=null;
     function loadRelatoriosScreen(){
       if (!google || !google.script || !google.script.run) { toast('Ambiente Apps Script indisponível'); return; }
+      const di = document.getElementById('filtroDataInicio').value || null;
+      const df = document.getElementById('filtroDataFim').value || null;
       google.script.run.withSuccessHandler(function(rep){
         __reports = rep || {};
         document.getElementById('kpiPedidosHoje').textContent = rep.kpis?.totalPedidosHoje || 0;
@@ -176,8 +194,11 @@
         document.getElementById('kpiClientesUnicos').textContent = rep.kpis?.totalClientesUnicos || 0;
         renderCharts(rep);
         renderPedidosMes(rep.pedidos?.mes || []);
-      }).withFailureHandler(function(err){ toast('Erro ao carregar relatórios: '+err.message); }).getSalesReports();
+      }).withFailureHandler(function(err){ toast('Erro ao carregar relatórios: '+err.message); }).getSalesReports(di, df);
     }
+
+    function aplicarFiltroPeriodo(){ loadRelatoriosScreen(); }
+    function limparFiltroPeriodo(){ document.getElementById('filtroDataInicio').value=''; document.getElementById('filtroDataFim').value=''; loadRelatoriosScreen(); }
 
     function renderCharts(rep){
       try{ if(chartV){chartV.destroy()} }catch(_){ }
@@ -229,6 +250,14 @@
       const blob = new Blob([csv],{type:'text/csv;charset=utf-8;'});
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a'); a.href=url; a.download='relatorio_cardaplan.csv'; a.click(); URL.revokeObjectURL(url);
+    }
+
+    function exportRelatorioXLSX(){
+      if(!__reports){ toast('Carregue os relatórios primeiro'); return; }
+      google.script.run.withSuccessHandler(function(res){
+        if (res && res.downloadUrl) { window.open(res.downloadUrl,'_blank'); }
+        else { toast('XLSX gerado. ID: '+(res?.fileId||'-')); }
+      }).withFailureHandler(function(err){ toast('Erro ao gerar XLSX: '+err.message); }).gerarRelatorioXLSX(__reports);
     }
 
     document.addEventListener('DOMContentLoaded', function(){ showTab('pedidos'); });
