@@ -2169,6 +2169,32 @@
             return appConfig[section]?.[key] || defaultValue;
         }
 
+        // ID alternado local (rotativo por sessão). Não depende de backend.
+        (function(){
+            try {
+                if (!window.__altIdCounter) {
+                    // Persistir no sessionStorage para evitar repetição ao longo da sessão
+                    const saved = sessionStorage.getItem('altIdCounter');
+                    window.__altIdCounter = saved ? parseInt(saved, 10) || 0 : 0;
+                }
+            } catch (_) { window.__altIdCounter = 0; }
+        })();
+
+        function gerarIdAlternadoLocal() {
+            try {
+                const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+                const n = (window.__altIdCounter || 0);
+                const letter = letters[n % letters.length];
+                const number = ("0" + (n % 100)).slice(-2);
+                const id = `${letter}${number}`;
+                window.__altIdCounter = n + 1;
+                try { sessionStorage.setItem('altIdCounter', String(window.__altIdCounter)); } catch(_) {}
+                return id;
+            } catch (e) {
+                return 'ID00';
+            }
+        }
+
         function getCompanyName() {
             return getConfig('identidade_visual', 'nome_empresa', 'Cardápio Digital');
         }
@@ -2583,9 +2609,21 @@
                         preco: item.preco, // Manter como string para suportar preços múltiplos
                         imagem: processImageUrl(item.foto_url),
                         disponivel: true,
+                        estoque_inicial: (item.estoque_inicial || '').toString().trim(),
+                        estoque_atual: (item.estoque_atual || '').toString().trim(),
+                        controle_estoque: (item.controle_estoque || '').toString().trim(),
+                        usar_id_alternado: (item.usar_id_alternado || '').toString().trim(),
                         classificacaoAdicional: item.classificacao_adicional,
                         observacoes: item.observacoes
                     };
+                    // Disponibilidade por estoque
+                    try {
+                        const ctrl = (processedItem.controle_estoque || '').toLowerCase();
+                        const estAtual = parseInt((processedItem.estoque_atual || '0').replace(/[^\d-]/g, ''), 10) || 0;
+                        if (ctrl === 'sim' && estAtual <= 0) {
+                            processedItem.disponivel = false;
+                        }
+                    } catch (_) {}
                     
                     // Add the item to each valid category
                     itemCategories.forEach(categoryName => {
@@ -7167,19 +7205,62 @@
             const deliveryFee = currentDeliveryFee || 0;
             const discountValue = coupon.valor_desconto || coupon.valor || '';
             const discountType = coupon.tipo_desconto || coupon.tipo || '';
+            const minValueRaw = (coupon.valor_minimo_pedido || coupon.minimo || '').toString();
+            const onlySkuRaw = (coupon.aplica_somente_sku || coupon.somente_sku || '').toString();
             
             debugLog('💰 Calculando desconto do cupom:');
             debugLog('- Tipo:', discountType);
             debugLog('- Valor:', discountValue);
             debugLog('- Cart Total:', cartTotal);
             debugLog('- Delivery Fee:', deliveryFee);
+            if (minValueRaw) debugLog('- Min Pedido:', minValueRaw);
+            if (onlySkuRaw) debugLog('- Apenas SKU:', onlySkuRaw);
             
+            // Regra de valor mínimo
+            try {
+                if (minValueRaw) {
+                    const minValue = parseFloat(minValueRaw.replace(/[^\d.,-]/g, '').replace(',', '.')) || 0;
+                    const subtotalProducts = cart.reduce((sum, item) => {
+                        const priceNum = (typeof parsePrice === 'function') ? parsePrice(item.preco) : parseFloat(String(item.preco).replace(/[^0-9.,]/g, '').replace(',', '.'));
+                        return priceNum > 0 ? sum + (priceNum * (item.quantity || 0)) : sum;
+                    }, 0);
+                    const candidateTotals = { produtos: subtotalProducts, frete: deliveryFee, total: subtotalProducts + deliveryFee };
+                    const checkType = (discountType || 'total').toLowerCase();
+                    const compareValue = candidateTotals[checkType] ?? (subtotalProducts + deliveryFee);
+                    if (compareValue < minValue) {
+                        debugLog('❌ Cupom exige mínimo de', minValue, 'valor atual:', compareValue);
+                        return 0;
+                    }
+                }
+            } catch (e) { if (typeof warnLog === 'function') warnLog('Regra de mínimo falhou:', e.message); }
+
+            // Regra de SKU
+            let allowedSkusSet = null;
+            try {
+                if (onlySkuRaw && onlySkuRaw.trim() !== '') {
+                    allowedSkusSet = new Set(onlySkuRaw.split(',').map(s => s.trim()).filter(Boolean));
+                    const matches = cart.some(it => allowedSkusSet.has((it.sku || '').toString()));
+                    if (!matches) {
+                        debugLog('❌ Cupom restrito a SKU(s) não encontrado(s) no carrinho');
+                        return 0;
+                    }
+                }
+            } catch (e) { if (typeof warnLog === 'function') warnLog('Regra de SKU falhou:', e.message); }
+
             let baseValue = 0;
             
             // Determinar valor base para cálculo
             switch (discountType.toLowerCase()) {
                 case 'produtos':
-                    baseValue = cartTotal;
+                    if (allowedSkusSet) {
+                        baseValue = cart.reduce((sum, it) => {
+                            const priceNum = (typeof parsePrice === 'function') ? parsePrice(it.preco) : parseFloat(String(it.preco).replace(/[^0-9.,]/g, '').replace(',', '.'));
+                            const isAllowed = allowedSkusSet.has((it.sku || '').toString());
+                            return isAllowed && priceNum > 0 ? sum + (priceNum * (it.quantity || 0)) : sum;
+                        }, 0);
+                    } else {
+                        baseValue = cartTotal;
+                    }
                     if (baseValue <= 0) {
                         debugLog('❌ Cupom de produtos: carrinho vazio');
                         return -1; // Indicador de erro específico
@@ -7193,7 +7274,16 @@
                     }
                     break;
                 case 'total':
-                    baseValue = cartTotal + deliveryFee;
+                    if (allowedSkusSet) {
+                        const allowedSubtotal = cart.reduce((sum, it) => {
+                            const priceNum = (typeof parsePrice === 'function') ? parsePrice(it.preco) : parseFloat(String(it.preco).replace(/[^0-9.,]/g, '').replace(',', '.'));
+                            const isAllowed = allowedSkusSet.has((it.sku || '').toString());
+                            return isAllowed && priceNum > 0 ? sum + (priceNum * (it.quantity || 0)) : sum;
+                        }, 0);
+                        baseValue = allowedSubtotal + deliveryFee;
+                    } else {
+                        baseValue = cartTotal + deliveryFee;
+                    }
                     if (baseValue <= 0) {
                         debugLog('❌ Cupom de total: valores zerados');
                         return -1; // Indicador de erro específico

@@ -29,7 +29,11 @@ const SHEET_CONFIG = {
       { name: 'status', type: 'select', required: true, options: ['Ativo', 'Inativo', 'Esgotado'] },
       { name: 'classificacao_adicional', type: 'text', required: false },
       { name: 'observacoes', type: 'textarea', required: false },
-      { name: 'foto_url', type: 'url', required: false }
+      { name: 'foto_url', type: 'url', required: false },
+      { name: 'estoque_inicial', type: 'number', required: false },
+      { name: 'estoque_atual', type: 'number', required: false },
+      { name: 'controle_estoque', type: 'select', required: false, options: ['Sim', 'Não'] },
+      { name: 'usar_id_alternado', type: 'select', required: false, options: ['Sim', 'Não'] }
     ]
   },
   'Categorias': {
@@ -78,7 +82,9 @@ const SHEET_CONFIG = {
       { name: 'tipo_desconto', type: 'select', required: true, options: ['produtos', 'total', 'frete'] },
       { name: 'valor_desconto', type: 'number%', required: true },
       { name: 'data_inicio', type: 'dd/mm/aa', required: true },
-      { name: 'data_fim', type: 'dd/mm/aaaa', required: true }
+      { name: 'data_fim', type: 'dd/mm/aaaa', required: true },
+      { name: 'valor_minimo_pedido', type: 'currency', required: false },
+      { name: 'aplica_somente_sku', type: 'text', required: false }
     ]
   },
   'Analytics': {
@@ -105,8 +111,15 @@ const cache = {
 /**
  * Função principal para servir a aplicação web
  */
-function doGet() {
+function doGet(e) {
   try {
+    if (e && e.parameter && e.parameter.action === 'receiveOrder') {
+      Logger.log('[doGet] Recebendo pedido via GET');
+      const result = handleIncomingOrder_(e);
+      return ContentService
+        .createTextOutput(JSON.stringify({ success: true, data: result }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
     Logger.log('[doGet] Iniciando aplicação web');
     
     const htmlOutput = HtmlService.createHtmlOutputFromFile("Index")
@@ -120,6 +133,279 @@ function doGet() {
     Logger.log(`[doGet] ERRO: ${error.message}`);
     console.error("Erro ao carregar página:", error);
     return HtmlService.createHtmlOutput("<h1>Erro ao carregar a aplicação</h1><p>Tente novamente em alguns instantes.</p>");
+  }
+}
+
+/**
+ * ===== Novos utilitários e endpoints profissionais =====
+ */
+
+function getAllConfigMap_() {
+  const data = getSheetData('Config');
+  const cfg = {};
+  if (!data || data.length <= 1) return cfg;
+  const rows = data.slice(1);
+  rows.forEach(r => {
+    const section = (r[0] || '').toString().trim();
+    const key = (r[1] || '').toString().trim();
+    const value = (r[2] || '').toString().trim();
+    if (!section || !key) return;
+    if (!cfg[section]) cfg[section] = {};
+    cfg[section][key] = value;
+  });
+  return cfg;
+}
+
+function getConfigValue_(section, key, defaultValue) {
+  const cfg = getAllConfigMap_();
+  const has = cfg[section] && Object.prototype.hasOwnProperty.call(cfg[section], key);
+  if (!has) return defaultValue;
+  const v = cfg[section][key];
+  if (v === '' || v === null || v === undefined) return defaultValue;
+  return v;
+}
+
+function getTaxaUnicaGlobal_() {
+  var sections = ['checkout','envio','geral','config'];
+  for (var i = 0; i < sections.length; i++) {
+    var raw = getConfigValue_(sections[i], 'valor_taxa_unica', null);
+    if (raw && raw.toString().trim() !== '') {
+      var parsed = parseFloat(raw.toString().replace(',', '.'));
+      if (!isNaN(parsed)) return parsed;
+    }
+  }
+  return null;
+}
+
+function getItensHeaderIndexes_() {
+  const data = getSheetData('Itens');
+  if (!data || data.length === 0) return {};
+  const headers = data[0].map(h => (h || '').toString().trim());
+  function idx(name) { return headers.indexOf(name); }
+  return {
+    idxSKU: idx('SKU'),
+    idxItem: idx('item'),
+    idxStatus: idx('status'),
+    idxEstoqueInicial: idx('estoque_inicial'),
+    idxEstoqueAtual: idx('estoque_atual'),
+    idxControleEstoque: idx('controle_estoque'),
+    idxUsarIdAlternado: idx('usar_id_alternado')
+  };
+}
+
+function atualizarEstoque_(sku, quantidadeSaindo, referencia) {
+  if (!sku || !quantidadeSaindo || quantidadeSaindo <= 0) return { updated: false };
+  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = spreadsheet.getSheetByName('Itens');
+  if (!sheet) return { updated: false };
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return { updated: false };
+
+  const idx = getItensHeaderIndexes_();
+  if (idx.idxSKU === -1) return { updated: false };
+
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var rowSKU = (row[idx.idxSKU] || '').toString().trim();
+    if (rowSKU === sku) {
+      var controleAtivo = true;
+      if (idx.idxControleEstoque !== -1) {
+        controleAtivo = ((row[idx.idxControleEstoque] || '').toString().toLowerCase() === 'sim');
+      }
+      if (!controleAtivo) return { updated: false, message: 'Controle de estoque desativado para SKU ' + sku };
+
+      if (idx.idxEstoqueAtual === -1) return { updated: false, message: 'Coluna estoque_atual não encontrada' };
+      var estoqueAtual = parseFloat(row[idx.idxEstoqueAtual] || 0) || 0;
+      var novoEstoque = Math.max(0, estoqueAtual - quantidadeSaindo);
+      sheet.getRange(i + 1, idx.idxEstoqueAtual + 1).setValue(novoEstoque);
+
+      if (novoEstoque === 0 && idx.idxStatus !== -1) {
+        sheet.getRange(i + 1, idx.idxStatus + 1).setValue('Esgotado');
+      }
+
+      try {
+        const hist = spreadsheet.getSheetByName('Estoque_Historico') || spreadsheet.insertSheet('Estoque_Historico');
+        const itemName = (idx.idxItem !== -1 ? (row[idx.idxItem] || '') : sku);
+        if (hist.getLastRow() === 0) {
+          hist.appendRow(['timestamp','SKU','item','movimentacao','quantidade','estoque_apos','referencia']);
+        }
+        hist.appendRow([new Date(), sku, itemName, 'SAÍDA', quantidadeSaindo, novoEstoque, referencia || '' ]);
+      } catch (e) { Logger.log('[atualizarEstoque_] historico: ' + e.message); }
+      return { updated: true, estoque_apos: novoEstoque };
+    }
+  }
+  return { updated: false, message: 'SKU não encontrado' };
+}
+
+function ensurePedidosSheets_() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const pedidos = ss.getSheetByName('Pedidos') || ss.insertSheet('Pedidos');
+  const rel = ss.getSheetByName('Relatórios') || ss.insertSheet('Relatórios');
+  if (pedidos.getLastRow() === 0) {
+    pedidos.appendRow(['timestamp','id_pedido','cliente_nome','whatsapp_cliente','tipo_entrega','endereco','itens_json','subtotal_produtos','taxa_entrega','desconto_cupom','total_final','status_pedido','metodo_pagamento','mensagem_whatsapp']);
+  }
+  if (rel.getLastRow() === 0) {
+    rel.appendRow(['mes','produto_sku','produto_nome','quantidade','valor_total']);
+  }
+}
+
+function handleIncomingOrder_(e) {
+  ensurePedidosSheets_();
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const pedidos = ss.getSheetByName('Pedidos');
+
+  var payload = {};
+  try { if (e.parameter && e.parameter.data) { payload = JSON.parse(e.parameter.data); } } catch (err) { Logger.log('parse data: ' + err.message); }
+
+  var customerName = e.parameter.customer_name || (payload.customer && payload.customer.name) || '';
+  var whatsappCustomer = e.parameter.whatsapp_customer || payload.whatsapp_customer || '';
+  var deliveryType = (payload.customer && payload.customer.delivery_type) || e.parameter.delivery_type || 'default';
+  var totalFinal = parseFloat(e.parameter.total_final || e.parameter.total || (payload.totals && payload.totals.total_final_numeric) || payload.total || 0) || 0;
+  var subtotal = parseFloat(e.parameter.subtotal_products || (payload.totals && payload.totals.subtotal_products_numeric) || 0) || 0;
+  var taxa = parseFloat(e.parameter.delivery_fee || (payload.totals && payload.totals.delivery_fee_numeric) || 0) || 0;
+  var desconto = parseFloat(e.parameter.coupon_discount || (payload.coupon && payload.coupon.discount_numeric) || 0) || 0;
+  var metodoPagamento = (payload.customer && payload.customer.payment_method) || '';
+  var message = e.parameter.message || payload.formatted_message || payload.whatsapp_message || '';
+  var addressText = '';
+  if (payload.customer && payload.customer.address) { try { addressText = JSON.stringify(payload.customer.address); } catch (_) {} }
+
+  var idPedido = 'PD' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMddHHmmss') + ('' + new Date().getTime()).slice(-3);
+
+  var itens = Array.isArray(payload.items) ? payload.items : [];
+  var itensJson = '';
+  try { itensJson = JSON.stringify(itens); } catch (_) {}
+
+  pedidos.appendRow([ new Date(), idPedido, customerName, whatsappCustomer, deliveryType, addressText, itensJson, subtotal, taxa, desconto, totalFinal, 'Pendente', metodoPagamento, message ]);
+
+  itens.forEach(function(it){
+    var sku = (it.sku || '').toString();
+    var qty = parseInt(it.quantity || 0, 10) || 0;
+    if (sku && qty > 0) {
+      atualizarEstoque_(sku, qty, idPedido);
+    }
+  });
+
+  return { id_pedido: idPedido };
+}
+
+function updatePedidoStatus(idPedido, novoStatus) {
+  ensurePedidosSheets_();
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName('Pedidos');
+  const data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if ((data[i][1] || '') === idPedido) {
+      sheet.getRange(i + 1, 12).setValue(novoStatus);
+      if (novoStatus === 'Pedido pago ✅') {
+        try { agregarRelatorioMensal_(data[i]); } catch (e) { Logger.log('Relatório mensal erro: ' + e.message); }
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+function agregarRelatorioMensal_(pedidoRow) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const rel = ss.getSheetByName('Relatórios');
+  const itensJson = pedidoRow[6] || '[]';
+  var itens = [];
+  try { itens = JSON.parse(itensJson); } catch (_) {}
+  var mes = Utilities.formatDate(new Date(pedidoRow[0]), Session.getScriptTimeZone(), 'yyyy-MM');
+  itens.forEach(function(it){
+    var sku = (it.sku || '').toString();
+    var nome = (it.name || it.nome || '').toString();
+    var qtd = parseInt(it.quantity || 0, 10) || 0;
+    var subtotal = parseFloat(it.subtotal_numeric || 0) || (parseFloat(it.subtotal || 0) || 0);
+    if (!sku || qtd <= 0) return;
+    rel.appendRow([mes, sku, nome, qtd, subtotal]);
+  });
+}
+
+function getRelatoriosDashboardResumo() {
+  const hoje = new Date();
+  const tz = Session.getScriptTimeZone();
+  const inicioDia = new Date(Utilities.formatDate(hoje, tz, 'yyyy/MM/dd') + ' 00:00:00');
+  const inicioSemana = new Date(inicioDia); inicioSemana.setDate(inicioSemana.getDate() - inicioDia.getDay());
+  const inicioMes = new Date(hoje.getFullYear(), hoje.getMonth(), 1);
+
+  var analytics = { produtosMaisVisualizados: [] };
+  try { analytics = getAnalyticsReports(); } catch (e) { Logger.log('analytics fail: ' + e.message); }
+
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const pedidos = ss.getSheetByName('Pedidos');
+  var pedidosData = pedidos ? pedidos.getDataRange().getValues() : [];
+  var pagos = pedidosData.filter((r, i) => i > 0 && (r[11] || '') === 'Pedido pago ✅');
+
+  function filtroPeriodo(rows, inicio) {
+    return rows.filter(r => { var d = new Date(r[0]); return d >= inicio; });
+  }
+  function somaValor(rows) { return rows.reduce((acc, r) => acc + (parseFloat(r[10] || 0) || 0), 0); }
+
+  const pedidosHoje = filtroPeriodo(pagos, inicioDia);
+  const pedidosSemana = filtroPeriodo(pagos, inicioSemana);
+  const pedidosMes = filtroPeriodo(pagos, inicioMes);
+
+  const rel = ss.getSheetByName('Relatórios');
+  var topPedidos = [];
+  if (rel) {
+    var relData = rel.getDataRange().getValues();
+    var mapa = {};
+    relData.forEach((r, i) => {
+      if (i === 0) return;
+      var mes = r[0]; var sku = r[1]; var nome = r[2]; var q = parseInt(r[3] || 0, 10) || 0; var v = parseFloat(r[4] || 0) || 0;
+      if (!sku) return;
+      if (!mapa[sku]) mapa[sku] = { sku: sku, nome: nome, quantidade: 0, valor: 0 };
+      mapa[sku].quantidade += q;
+      mapa[sku].valor += v;
+    });
+    topPedidos = Object.values(mapa).sort((a,b) => b.quantidade - a.quantidade).slice(0, 10);
+  }
+
+  return {
+    produtosMaisVisualizados: analytics.produtosMaisVisualizados || [],
+    produtosMaisPedidos: topPedidos,
+    valorTotalVendidoMes: somaValor(pedidosMes),
+    pedidosHoje: pedidosHoje,
+    pedidosSemana: pedidosSemana,
+    pedidosMes: pedidosMes
+  };
+}
+
+function exportarDadosCSV(tabela, somentePagos) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(tabela);
+  if (!sheet) throw new Error('Aba não encontrada: ' + tabela);
+  var data = sheet.getDataRange().getValues();
+  if (tabela === 'Pedidos' && somentePagos) {
+    data = data.filter((r,i) => i === 0 || (r[11] || '') === 'Pedido pago ✅');
+  }
+  const csv = data.map(r => r.map(v => '"' + String(v).replace(/"/g,'""') + '"').join(',')).join('\n');
+  return csv;
+}
+
+function gerarRelatorioVendasMesPDF() {
+  try {
+    const resumo = getRelatoriosDashboardResumo();
+    const doc = DocumentApp.create('Relatorio_Vendas_Mensal');
+    const body = doc.getBody();
+    body.appendParagraph('Relatório de Vendas - Mês corrente').setHeading(DocumentApp.ParagraphHeading.HEADING1);
+    body.appendParagraph('Valor total vendido: R$ ' + (resumo.valorTotalVendidoMes || 0).toFixed(2));
+    body.appendParagraph('Produtos mais pedidos:').setHeading(DocumentApp.ParagraphHeading.HEADING2);
+    (resumo.produtosMaisPedidos || []).forEach((p, i) => {
+      body.appendParagraph((i+1)+'. '+p.nome+' ('+p.sku+'): '+p.quantidade+' un. - R$ '+(p.valor||0).toFixed(2));
+    });
+    doc.saveAndClose();
+    const file = DriveApp.getFileById(doc.getId());
+    const pdfBlob = file.getBlob().getAs('application/pdf');
+    const pdfFile = DriveApp.createFile(pdfBlob);
+    pdfFile.setName('Relatorio_Vendas_Mensal_'+ new Date().toISOString().split('T')[0] + '.pdf');
+    DriveApp.getFileById(doc.getId()).setTrashed(true);
+    return pdfFile.getUrl();
+  } catch (e) {
+    Logger.log('[gerarRelatorioVendasMesPDF] ' + e.message);
+    throw e;
   }
 }
 
@@ -733,6 +1019,14 @@ function getBairrosList() {
 function getTaxaEntregaBairro(nomeBairro) {
   try {
     Logger.log(`[getTaxaEntregaBairro] Buscando taxa para: ${nomeBairro}`);
+    // Prioriza taxa única se configurada em Config
+    try {
+      var taxaUnica = getTaxaUnicaGlobal_ && getTaxaUnicaGlobal_();
+      if (taxaUnica !== null && !isNaN(taxaUnica)) {
+        Logger.log(`[getTaxaEntregaBairro] Taxa única global aplicada: R$ ${taxaUnica.toFixed(2)}`);
+        return taxaUnica;
+      }
+    } catch (e) { Logger.log('[getTaxaEntregaBairro] aviso taxa única: ' + e.message); }
     
     const data = getSheetData('Bairros');
     if (data.length <= 1) {
