@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <base target="_top" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Cardaplan - Pedidos & Relatórios</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root{--primary:#FF9552;--bg:#0A0A0B;--surface:#111113;--text:#fff;--muted:#B4B4B8;--border:#2A2A2D;--success:#10B981;--error:#EF4444;--warning:#F59E0B}
+    body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
+    .container{max-width:980px;margin:0 auto;padding:16px}
+    .header{position:sticky;top:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px 16px;z-index:10}
+    .title{font-weight:800}
+    .tabs{display:flex;gap:8px;margin:12px 0}
+    .tab{padding:8px 12px;border:1px solid var(--border);border-radius:8px;background:transparent;color:var(--muted);cursor:pointer}
+    .tab.active{background:var(--primary);color:#fff;border-color:transparent}
+    .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px}
+    .row{display:flex;gap:12px;align-items:center}
+    .row.wrap{flex-wrap:wrap}
+    .col{flex:1}
+    .actions{display:flex;gap:8px}
+    .btn{border:none;border-radius:8px;padding:10px 14px;cursor:pointer;font-weight:600}
+    .btn.primary{background:var(--primary);color:#fff}
+    .btn.secondary{background:#1A1A1D;color:var(--text);border:1px solid var(--border)}
+    .btn.success{background:var(--success);color:#fff}
+    .btn.danger{background:var(--error);color:#fff}
+    .btn.warning{background:var(--warning);color:#000}
+    .muted{color:var(--muted)}
+    .list{display:flex;flex-direction:column;gap:12px;margin-top:12px}
+    .h2{font-size:18px;font-weight:800;margin:0 0 8px}
+    .h3{font-size:16px;font-weight:700;margin:0 0 6px}
+    input[type="text"], select{width:100%;padding:10px;border-radius:8px;border:1px solid var(--border);background:#0f0f11;color:var(--text)}
+    .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+    @media (max-width: 800px){.grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
+    @media (max-width: 480px){.grid{grid-template-columns:1fr}}
+    .metric{padding:16px;border-radius:12px;background:var(--surface);border:1px solid var(--border)}
+    .metric .label{color:var(--muted);font-size:12px}
+    .metric .value{font-size:24px;font-weight:900;margin-top:6px}
+    .pill{display:inline-block;padding:4px 8px;border-radius:999px;border:1px solid var(--border);font-size:12px}
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="container row wrap">
+      <div class="col"><div class="title">Cardaplan</div><div class="muted" style="font-size:12px">Gestão de Pedidos e Relatórios</div></div>
+      <div class="actions">
+        <button class="btn secondary" onclick="showTab('pedidos')">Pedidos 🔔</button>
+        <button class="btn secondary" onclick="showTab('relatorios')">Relatórios 📊</button>
+      </div>
+    </div>
+    <div class="container tabs">
+      <div class="tab active" id="tab-pedidos" onclick="showTab('pedidos')">Pedidos</div>
+      <div class="tab" id="tab-relatorios" onclick="showTab('relatorios')">Relatórios</div>
+    </div>
+  </div>
+
+  <div class="container" id="screen-pedidos">
+    <div class="card">
+      <div class="row wrap" style="gap:8px">
+        <div class="col"><input id="pedidosFilter" type="text" placeholder="Filtrar por cliente, status, total..." oninput="filterPedidos()" /></div>
+        <div class="actions">
+          <button class="btn secondary" onclick="loadPedidosScreen()">Atualizar</button>
+        </div>
+      </div>
+      <div class="muted" id="pedidosCount" style="margin-top:8px">0 pedidos</div>
+      <div class="list" id="pedidosList"></div>
+      <div class="muted" id="pedidosEmpty" style="display:none;margin-top:8px">Nenhum pedido encontrado.</div>
+    </div>
+  </div>
+
+  <div class="container" id="screen-relatorios" style="display:none">
+    <div class="grid" style="margin-bottom:12px">
+      <div class="metric"><div class="label">Pedidos Hoje</div><div class="value" id="kpiPedidosHoje">0</div></div>
+      <div class="metric"><div class="label">Ticket Médio</div><div class="value" id="kpiTicketMedio">R$ 0,00</div></div>
+      <div class="metric"><div class="label">Mais Vendido</div><div class="value" id="kpiMaisVendido">-</div></div>
+      <div class="metric"><div class="label">Clientes Únicos</div><div class="value" id="kpiClientesUnicos">0</div></div>
+    </div>
+
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <div class="h2">Produtos mais visualizados</div>
+      <div class="actions">
+        <button class="btn secondary" onclick="loadRelatoriosScreen()">Atualizar</button>
+        <button class="btn primary" onclick="exportRelatorioPDF()">Exportar PDF</button>
+        <button class="btn secondary" onclick="exportRelatorioCSV()">Exportar CSV</button>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:12px"><canvas id="chartVisualizados" height="140"></canvas></div>
+
+    <div class="h2">Produtos mais pedidos</div>
+    <div class="card" style="margin-bottom:12px"><canvas id="chartMaisPedidos" height="140"></canvas></div>
+
+    <div class="h2">Pedidos do mês</div>
+    <div class="card"><div id="listaPedidosMes" class="list"></div></div>
+  </div>
+
+  <script>
+    // Navegação
+    function showTab(name){
+      document.getElementById('screen-pedidos').style.display = (name==='pedidos')? 'block':'none';
+      document.getElementById('screen-relatorios').style.display = (name==='relatorios')? 'block':'none';
+      document.getElementById('tab-pedidos').classList.toggle('active', name==='pedidos');
+      document.getElementById('tab-relatorios').classList.toggle('active', name==='relatorios');
+      if(name==='pedidos') loadPedidosScreen(); else loadRelatoriosScreen();
+    }
+
+    // Util
+    function fmtMoney(v){ try{ return (new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'})).format(Number(v)||0);}catch(_){return 'R$ '+(Number(v)||0).toFixed(2)} }
+    function toast(msg){ console.log(msg); }
+
+    // ---------- Pedidos ----------
+    let __orders = [];
+    function loadPedidosScreen(){
+      document.getElementById('pedidosList').innerHTML = '';
+      document.getElementById('pedidosEmpty').style.display = 'none';
+      google.script.run.withSuccessHandler(function(orders){
+        __orders = orders || [];
+        document.getElementById('pedidosCount').textContent = `${__orders.length} pedidos`;
+        renderPedidos(__orders);
+      }).withFailureHandler(function(err){ toast('Erro ao carregar pedidos: '+err.message); }).getOrders();
+    }
+
+    function filterPedidos(){
+      const q = (document.getElementById('pedidosFilter').value||'').toLowerCase();
+      const filtered = __orders.filter(p => JSON.stringify(p.data).toLowerCase().includes(q));
+      document.getElementById('pedidosCount').textContent = `${filtered.length} pedidos`;
+      renderPedidos(filtered);
+    }
+
+    function renderPedidos(list){
+      const el = document.getElementById('pedidosList');
+      el.innerHTML = '';
+      if(!list.length){ document.getElementById('pedidosEmpty').style.display='block'; return; }
+      document.getElementById('pedidosEmpty').style.display='none';
+      list.forEach(p => {
+        const d = p.data;
+        const card = document.createElement('div'); card.className='card';
+        const status = String(d.status_pedido||'Pendente');
+        card.innerHTML = `
+          <div class="row wrap" style="justify-content:space-between">
+            <div>
+              <div class="h3">${d.cliente_nome||'-'} <span class="pill">${status}</span></div>
+              <div class="muted" style="font-size:12px">${new Date(d.data_hora).toLocaleString('pt-BR')}</div>
+              <div class="muted" style="font-size:12px">Total: ${fmtMoney(d.total||0)} | Tipo: ${d.tipo_entrega||'-'}</div>
+            </div>
+            <div class="actions">
+              <button class="btn success" onclick="marcarPago(${p.rowIndex})">Pago ✅</button>
+              <button class="btn danger" onclick="marcarCancelado(${p.rowIndex})">Cancelado ❌</button>
+            </div>
+          </div>
+          <details style="margin-top:8px"><summary class="muted">Ver itens</summary><pre style="white-space:pre-wrap;color:#ddd;background:#0f0f11;border:1px solid var(--border);border-radius:8px;padding:8px">${JSON.stringify(JSON.parse(d.itens_json||'[]'), null, 2)}</pre></details>
+        `;
+        el.appendChild(card);
+      });
+    }
+
+    function marcarPago(rowIndex){
+      google.script.run.withSuccessHandler(function(){ loadPedidosScreen(); }).withFailureHandler(function(err){ toast('Erro: '+err.message); }).updateOrderStatus(rowIndex,'Pedido pago ✅');
+    }
+    function marcarCancelado(rowIndex){
+      google.script.run.withSuccessHandler(function(){ loadPedidosScreen(); }).withFailureHandler(function(err){ toast('Erro: '+err.message); }).updateOrderStatus(rowIndex,'Pedido cancelado ❌');
+    }
+
+    // ---------- Relatórios ----------
+    let __reports = null; let chartV=null; let chartP=null;
+    function loadRelatoriosScreen(){
+      google.script.run.withSuccessHandler(function(rep){
+        __reports = rep || {};
+        // KPIs
+        document.getElementById('kpiPedidosHoje').textContent = rep.kpis?.totalPedidosHoje || 0;
+        document.getElementById('kpiTicketMedio').textContent = fmtMoney(rep.kpis?.ticketMedio || 0);
+        document.getElementById('kpiMaisVendido').textContent = rep.kpis?.produtoMaisVendido ? `${rep.kpis.produtoMaisVendido.produto} (${rep.kpis.produtoMaisVendido.quantidade})` : '-';
+        document.getElementById('kpiClientesUnicos').textContent = rep.kpis?.totalClientesUnicos || 0;
+        // Charts
+        renderCharts(rep);
+        // Lista pedidos do mês
+        renderPedidosMes(rep.pedidos?.mes || []);
+      }).withFailureHandler(function(err){ toast('Erro ao carregar relatórios: '+err.message); }).getSalesReports();
+    }
+
+    function renderCharts(rep){
+      // Visualizados
+      try{ if(chartV){chartV.destroy()} }catch(_){ }
+      const ctxV = document.getElementById('chartVisualizados').getContext('2d');
+      const labelsV = (rep.produtosMaisVisualizados||[]).map(x=>x.nomeItem);
+      const dataV = (rep.produtosMaisVisualizados||[]).map(x=>x.visualizacoes);
+      chartV = new Chart(ctxV,{type:'bar',data:{labels:labelsV,datasets:[{label:'Visualizações',data:dataV,backgroundColor:'#FF9552'}]},options:{plugins:{legend:{display:false}},responsive:true,maintainAspectRatio:false}});
+      // Mais pedidos
+      try{ if(chartP){chartP.destroy()} }catch(_){ }
+      const ctxP = document.getElementById('chartMaisPedidos').getContext('2d');
+      const labelsP = (rep.produtosMaisPedidos||[]).map(x=>x.produto);
+      const dataP = (rep.produtosMaisPedidos||[]).map(x=>x.quantidade);
+      chartP = new Chart(ctxP,{type:'bar',data:{labels:labelsP,datasets:[{label:'Quantidade',data:dataP,backgroundColor:'#10B981'}]},options:{plugins:{legend:{display:false}},responsive:true,maintainAspectRatio:false}});
+    }
+
+    function renderPedidosMes(list){
+      const el = document.getElementById('listaPedidosMes'); el.innerHTML = '';
+      if(!list.length){ el.innerHTML = '<div class="muted">Nenhum pedido no mês.</div>'; return; }
+      list.forEach(p => {
+        const d = p.data;
+        const div = document.createElement('div'); div.className='card';
+        div.innerHTML = `<div class="row" style="justify-content:space-between"><div><div class="h3">${d.cliente_nome||'-'}</div><div class="muted" style="font-size:12px">${new Date(d.data_hora).toLocaleString('pt-BR')}</div></div><div class="pill">${fmtMoney(d.total||0)}</div></div>`;
+        el.appendChild(div);
+      });
+    }
+
+    // Exportações
+    function exportRelatorioPDF(){
+      if(!__reports){ toast('Carregue os relatórios primeiro'); return; }
+      google.script.run.withSuccessHandler(function(res){
+        if (res && res.downloadUrl) { window.open(res.downloadUrl,'_blank'); }
+        else { toast('PDF gerado. ID: '+(res?.fileId||'-')); }
+      }).withFailureHandler(function(err){ toast('Erro ao gerar PDF: '+err.message); }).gerarRelatorioPDF(__reports);
+    }
+
+    function exportRelatorioCSV(){
+      if(!__reports){ toast('Carregue os relatórios primeiro'); return; }
+      const rows = [];
+      rows.push(['Produtos mais visualizados']);
+      rows.push(['Produto','Visualizações']);
+      (__reports.produtosMaisVisualizados||[]).forEach(x=>rows.push([x.nomeItem, x.visualizacoes]));
+      rows.push([]);
+      rows.push(['Produtos mais pedidos']);
+      rows.push(['Produto','Quantidade']);
+      (__reports.produtosMaisPedidos||[]).forEach(x=>rows.push([x.produto, x.quantidade]));
+      rows.push([]);
+      rows.push(['Pedidos do mês']);
+      rows.push(['Data','Cliente','Total']);
+      (__reports.pedidos?.mes||[]).forEach(p=>rows.push([new Date(p.data.data_hora).toLocaleString('pt-BR'), p.data.cliente_nome, (p.data.total||0)]));
+      const csv = rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+      const blob = new Blob([csv],{type:'text/csv;charset=utf-8;'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href=url; a.download='relatorio_cardaplan.csv'; a.click(); URL.revokeObjectURL(url);
+    }
+
+    // Inicialização
+    document.addEventListener('DOMContentLoaded', function(){ showTab('pedidos'); });
+  </script>
+</body>
+</html>
