@@ -8,6 +8,7 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     :root{--primary:#FF9552;--bg:#0A0A0B;--surface:#111113;--text:#fff;--muted:#B4B4B8;--border:#2A2A2D;--success:#10B981;--error:#EF4444;--warning:#F59E0B}
+    *{box-sizing:border-box}
     body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
     .container{max-width:980px;margin:0 auto;padding:16px}
     .header{position:sticky;top:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px 16px;z-index:10}
@@ -38,6 +39,7 @@
     .metric .label{color:var(--muted);font-size:12px}
     .metric .value{font-size:24px;font-weight:900;margin-top:6px}
     .pill{display:inline-block;padding:4px 8px;border-radius:999px;border:1px solid var(--border);font-size:12px}
+    details summary{cursor:pointer}
   </style>
 </head>
 <body>
@@ -95,7 +97,6 @@
   </div>
 
   <script>
-    // Navegação
     function showTab(name){
       document.getElementById('screen-pedidos').style.display = (name==='pedidos')? 'block':'none';
       document.getElementById('screen-relatorios').style.display = (name==='relatorios')? 'block':'none';
@@ -104,15 +105,14 @@
       if(name==='pedidos') loadPedidosScreen(); else loadRelatoriosScreen();
     }
 
-    // Util
     function fmtMoney(v){ try{ return (new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'})).format(Number(v)||0);}catch(_){return 'R$ '+(Number(v)||0).toFixed(2)} }
     function toast(msg){ console.log(msg); }
 
-    // ---------- Pedidos ----------
     let __orders = [];
     function loadPedidosScreen(){
       document.getElementById('pedidosList').innerHTML = '';
       document.getElementById('pedidosEmpty').style.display = 'none';
+      if (!google || !google.script || !google.script.run) { toast('Ambiente Apps Script indisponível'); return; }
       google.script.run.withSuccessHandler(function(orders){
         __orders = orders || [];
         document.getElementById('pedidosCount').textContent = `${__orders.length} pedidos`;
@@ -148,10 +148,14 @@
               <button class="btn danger" onclick="marcarCancelado(${p.rowIndex})">Cancelado ❌</button>
             </div>
           </div>
-          <details style="margin-top:8px"><summary class="muted">Ver itens</summary><pre style="white-space:pre-wrap;color:#ddd;background:#0f0f11;border:1px solid var(--border);border-radius:8px;padding:8px">${JSON.stringify(JSON.parse(d.itens_json||'[]'), null, 2)}</pre></details>
+          <details style="margin-top:8px"><summary class="muted">Ver itens</summary><pre style="white-space:pre-wrap;color:#ddd;background:#0f0f11;border:1px solid var(--border);border-radius:8px;padding:8px">${safePretty(d.itens_json)}</pre></details>
         `;
         el.appendChild(card);
       });
+    }
+
+    function safePretty(jsonStr){
+      try { return JSON.stringify(JSON.parse(jsonStr||'[]'), null, 2); } catch(_) { return String(jsonStr||''); }
     }
 
     function marcarPago(rowIndex){
@@ -161,31 +165,26 @@
       google.script.run.withSuccessHandler(function(){ loadPedidosScreen(); }).withFailureHandler(function(err){ toast('Erro: '+err.message); }).updateOrderStatus(rowIndex,'Pedido cancelado ❌');
     }
 
-    // ---------- Relatórios ----------
     let __reports = null; let chartV=null; let chartP=null;
     function loadRelatoriosScreen(){
+      if (!google || !google.script || !google.script.run) { toast('Ambiente Apps Script indisponível'); return; }
       google.script.run.withSuccessHandler(function(rep){
         __reports = rep || {};
-        // KPIs
         document.getElementById('kpiPedidosHoje').textContent = rep.kpis?.totalPedidosHoje || 0;
         document.getElementById('kpiTicketMedio').textContent = fmtMoney(rep.kpis?.ticketMedio || 0);
         document.getElementById('kpiMaisVendido').textContent = rep.kpis?.produtoMaisVendido ? `${rep.kpis.produtoMaisVendido.produto} (${rep.kpis.produtoMaisVendido.quantidade})` : '-';
         document.getElementById('kpiClientesUnicos').textContent = rep.kpis?.totalClientesUnicos || 0;
-        // Charts
         renderCharts(rep);
-        // Lista pedidos do mês
         renderPedidosMes(rep.pedidos?.mes || []);
       }).withFailureHandler(function(err){ toast('Erro ao carregar relatórios: '+err.message); }).getSalesReports();
     }
 
     function renderCharts(rep){
-      // Visualizados
       try{ if(chartV){chartV.destroy()} }catch(_){ }
       const ctxV = document.getElementById('chartVisualizados').getContext('2d');
       const labelsV = (rep.produtosMaisVisualizados||[]).map(x=>x.nomeItem);
       const dataV = (rep.produtosMaisVisualizados||[]).map(x=>x.visualizacoes);
       chartV = new Chart(ctxV,{type:'bar',data:{labels:labelsV,datasets:[{label:'Visualizações',data:dataV,backgroundColor:'#FF9552'}]},options:{plugins:{legend:{display:false}},responsive:true,maintainAspectRatio:false}});
-      // Mais pedidos
       try{ if(chartP){chartP.destroy()} }catch(_){ }
       const ctxP = document.getElementById('chartMaisPedidos').getContext('2d');
       const labelsP = (rep.produtosMaisPedidos||[]).map(x=>x.produto);
@@ -204,7 +203,6 @@
       });
     }
 
-    // Exportações
     function exportRelatorioPDF(){
       if(!__reports){ toast('Carregue os relatórios primeiro'); return; }
       google.script.run.withSuccessHandler(function(res){
@@ -233,7 +231,6 @@
       const a = document.createElement('a'); a.href=url; a.download='relatorio_cardaplan.csv'; a.click(); URL.revokeObjectURL(url);
     }
 
-    // Inicialização
     document.addEventListener('DOMContentLoaded', function(){ showTab('pedidos'); });
   </script>
 </body>
