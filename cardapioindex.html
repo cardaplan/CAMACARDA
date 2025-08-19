@@ -7791,6 +7791,15 @@
             if (!neighborhood || !dataSource.length) {
                 return null;
             }
+
+            // Taxa única por bairro via Config (aba Config: section=checkout, key=valor_taxa_unica)
+            try {
+                const uniqueFeeRaw = getConfig('checkout', 'valor_taxa_unica', '');
+                const uniqueFee = parseFloat(String(uniqueFeeRaw).replace(',', '.'));
+                if (!isNaN(uniqueFee) && uniqueFee > 0) {
+                    return uniqueFee;
+                }
+            } catch (_) {}
             
             const normalizedNeighborhood = neighborhood.trim().toLowerCase();
             
@@ -9727,7 +9736,12 @@
             showToast('Preparando seu pedido...', 'success', 2000);
             
             setTimeout(() => {
-                sendToWhatsApp();
+                // Se estiver em modo WhatsApp Web, ainda assim registramos pedido via Apps Script (GET) para Sessão de Pedidos
+                try {
+                    if (typeof sendToWhatsApp === 'function') {
+                        sendToWhatsApp();
+                    }
+                } catch (e) { errorLog('Erro ao enviar pedido:', e); }
             }, 1000);
         }
 
@@ -10291,7 +10305,8 @@
                 const hasValidPrice = !isNaN(itemPrice) && itemPrice > 0;
                 const itemSubtotal = hasValidPrice ? itemPrice * item.quantity : 0;
                 
-                message += `• *${item.nome}* (${item.sku})\n`;
+                const altSuffix = item.alt_id ? ` | ID: ${item.alt_id}` : '';
+                message += `• *${item.nome}* (${item.sku}${altSuffix})\n`;
                 if (item.variationText) {
                     // Melhorar formatação das variações no WhatsApp - substituir pipes por quebras de linha
                     const formattedVariations = item.variationText.replace(/\s*\|\s*/g, '\n     ');
@@ -10867,6 +10882,7 @@
                     id: item.id,
                     name: item.nome,
                     sku: item.sku,
+                    alt_id: item.alt_id || null,
                     price: item.preco,
                     price_numeric: parsePrice(item.preco),
                     quantity: item.quantity,
